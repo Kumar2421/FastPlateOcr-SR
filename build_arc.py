@@ -9,6 +9,7 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.nn.utils.rnn import pad_sequence
 from torchvision import transforms
 import editdistance
+from visualize_result import visualize_predictions , plot_training_curves
 
 from model import FastPlateOCR   # <-- your model.py
 # ---------------------------
