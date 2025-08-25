@@ -1,0 +1,33 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.log
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Model files
+*.pth
+*.pt
+*.pb
+
+# Dataset outputs
+processed_dataset/
+resized_plates/
+debug_failed/
+*.csv
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# IDE configs
+.vscode/
+.idea/
+*.swp
