@@ -10,7 +10,6 @@ from torch.nn.utils.rnn import pad_sequence
 from torchvision import transforms
 import editdistance
 from visualize_result import visualize_predictions , plot_training_curves
-
 from model import FastPlateOCR   # <-- your model.py
 # ---------------------------
 # Repro + cuDNN speed
@@ -183,6 +182,11 @@ def train_fastplateocr(csv_file, img_dir="src2/resized_plates",
         val_cer, val_acc = validate(model, val_loader, dataset, device, beam_width)
         val_cers.append(val_cer); val_accs.append(val_acc)
         # 🔥 Save sample result images each epoch
+        # Update charts
+        logs["train_losses"].append(total_loss/len(train_loader))
+        logs["val_cers"].append(val_cer)
+        logs["val_accs"].append(val_acc)
+        plot_training_curves(logs, out_dir="results")
         visualize_predictions(model, val_loader, dataset, device, epoch, out_dir="results")
 
         print(f"Epoch {epoch}/{epochs} | loss {avg_loss:.4f} | CER {val_cer:.3f} | Acc {val_acc:.3f} | lr {scheduler.get_last_lr()[0]:.6f}")
@@ -200,33 +204,39 @@ def train_fastplateocr(csv_file, img_dir="src2/resized_plates",
     return model, vocab, (train_losses, val_cers, val_accs)
 
 
-def visualize_predictions(model, val_loader, dataset, device, epoch, out_dir="results"):
+def visualize_predictions(model, dataset, device, epoch, num_samples=6, out_dir="results"):
     os.makedirs(out_dir, exist_ok=True)
     model.eval()
-    imgs, _, texts = next(iter(val_loader))
-    imgs = imgs.to(device)
+    idxs = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
 
-    fig, axes = plt.subplots(3, 2, figsize=(10, 8))  # 6 samples
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
     axes = axes.flatten()
 
     with torch.no_grad():
-        for i in range(len(axes)):
-            if i >= imgs.size(0): break
-            ids = model.beam_decode(imgs[i].unsqueeze(0), beam_width=5, device=device)
-            pred = dataset.seq_to_text(ids)
+        for j, idx in enumerate(idxs):
+            img_t, _, gt_text = dataset[idx]
+            img_t = img_t.unsqueeze(0).to(device)
 
-            # Convert back to numpy image
-            img = imgs[i].cpu().permute(1,2,0).numpy()
+            ids = model.beam_decode(img_t, beam_width=5, device=device)
+            pred_text = dataset.seq_to_text(ids)
+
+            # Convert back to numpy for visualization
+            img = img_t[0].cpu().permute(1,2,0).numpy()
             img = (img * np.array([0.229,0.224,0.225]) + np.array([0.485,0.456,0.406]))
             img = np.clip(img, 0, 1)
 
-            axes[i].imshow(img)
-            axes[i].set_title(f"GT: {texts[i]}\nPred: {pred}", fontsize=8)
-            axes[i].axis("off")
+            axes[j].imshow(img)
+            axes[j].set_title(f"GT: {gt_text}\nPred: {pred_text}", fontsize=9)
+            axes[j].axis("off")
+
+        # Hide unused subplots
+        for k in range(j+1, len(axes)):
+            axes[k].axis("off")
 
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"epoch_{epoch:02d}.png"))
     plt.close()
+
 
 # ---------------------------
 # Entry
