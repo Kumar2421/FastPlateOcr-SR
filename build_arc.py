@@ -181,6 +181,8 @@ def train_fastplateocr(csv_file, img_dir="src2/resized_plates",
 
         val_cer, val_acc = validate(model, val_loader, dataset, device, beam_width)
         val_cers.append(val_cer); val_accs.append(val_acc)
+        # 🔥 Save sample result images each epoch
+        visualize_predictions(model, val_loader, dataset, device, epoch, out_dir="results")
 
         print(f"Epoch {epoch}/{epochs} | loss {avg_loss:.4f} | CER {val_cer:.3f} | Acc {val_acc:.3f} | lr {scheduler.get_last_lr()[0]:.6f}")
 
@@ -196,6 +198,34 @@ def train_fastplateocr(csv_file, img_dir="src2/resized_plates",
 
     return model, vocab, (train_losses, val_cers, val_accs)
 
+
+def visualize_predictions(model, val_loader, dataset, device, epoch, out_dir="results"):
+    os.makedirs(out_dir, exist_ok=True)
+    model.eval()
+    imgs, _, texts = next(iter(val_loader))
+    imgs = imgs.to(device)
+
+    fig, axes = plt.subplots(3, 2, figsize=(10, 8))  # 6 samples
+    axes = axes.flatten()
+
+    with torch.no_grad():
+        for i in range(len(axes)):
+            if i >= imgs.size(0): break
+            ids = model.beam_decode(imgs[i].unsqueeze(0), beam_width=5, device=device)
+            pred = dataset.seq_to_text(ids)
+
+            # Convert back to numpy image
+            img = imgs[i].cpu().permute(1,2,0).numpy()
+            img = (img * np.array([0.229,0.224,0.225]) + np.array([0.485,0.456,0.406]))
+            img = np.clip(img, 0, 1)
+
+            axes[i].imshow(img)
+            axes[i].set_title(f"GT: {texts[i]}\nPred: {pred}", fontsize=8)
+            axes[i].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"epoch_{epoch:02d}.png"))
+    plt.close()
 
 # ---------------------------
 # Entry
