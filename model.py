@@ -1,139 +1,254 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+import os, cv2, math, random, numpy as np, pandas as pd
+from collections import Counter
+from PIL import Image
+import matplotlib.pyplot as plt
+
+import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch.cuda.amp import autocast, GradScaler
+from torch.nn.utils.rnn import pad_sequence
+from torchvision import transforms
+import editdistance
+from visualize_result import visualize_predictions , plot_training_curves
+from model import FastPlateOCR   # <-- your model.py
+# ---------------------------
+# Repro + cuDNN speed
+# ---------------------------
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.enabled = True
 
 
 # ---------------------------
-# Positional Encoding
+# Utility: resize & pad
 # ---------------------------
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() *
-            (-torch.log(torch.tensor(10000.0)) / d_model)
+def resize_keep_h_pad(img, target_h, max_w):
+    h, w = img.shape[:2]
+    scale = target_h / h
+    new_w = int(w * scale)
+    if new_w > max_w:
+        new_w = max_w
+    img = cv2.resize(img, (new_w, target_h))
+    canvas = np.full((target_h, max_w, 3), 255, dtype=np.uint8)
+    canvas[:, :new_w] = img
+    pil = Image.fromarray(canvas)
+    return pil, new_w
+
+
+# ---------------------------
+# Dataset
+# ---------------------------
+class PlateDataset(Dataset):
+    def __init__(self, csv_file, vocab, target_h=96, max_w=512, train=True, img_dir="src2/resized_plates"):
+        self.df = pd.read_csv(csv_file)
+        self.vocab = vocab
+        self.char2idx = {c: i for i, c in enumerate(vocab)}
+        self.idx2char = {i: c for i, c in enumerate(vocab)}
+        self.target_h, self.max_w = target_h, max_w
+        self.train = train
+        self.img_dir = img_dir
+
+        self.tx = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        ])
+
+    def __len__(self): return len(self.df)
+
+    def text_to_seq(self, text):
+        return torch.tensor(
+            [self.char2idx['<sos>']] +
+            [self.char2idx[c] for c in str(text) if c in self.char2idx] +
+            [self.char2idx['<eos>']], dtype=torch.long
         )
-        pe[:, 0::2] = torch.sin(pos * div_term)
-        pe[:, 1::2] = torch.cos(pos * div_term)
-        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
-        self.register_buffer('pe', pe)
 
-    def forward(self, x):
-        # x: [B, T, C]
-        return x + self.pe[:, :x.size(1)]
+    def seq_to_text(self, seq):
+        out=[]
+        for i in seq:
+            i=int(i)
+            if i==self.char2idx['<eos>']: break
+            if i not in (self.char2idx['<sos>'], self.char2idx['<pad>']):
+                out.append(self.idx2char[i])
+        return "".join(out)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = os.path.join(self.img_dir, row["image_name"])
+
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"⚠️ Missing: {img_path}")
+            img = np.zeros((self.target_h, self.max_w, 3), dtype=np.uint8)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        pil, _ = resize_keep_h_pad(img, self.target_h, self.max_w)
+        img_t = self.tx(pil)
+
+        text = row["license_plate"]
+        seq = self.text_to_seq(text)
+
+        if idx % 500 == 0:
+            print(f"📸 Processing {img_path} -> {text}")
+        return img_t, seq, text
+
+
+def collate_fn(batch):
+    imgs, seqs, texts = zip(*batch)
+    imgs = torch.stack(imgs)
+    seqs = pad_sequence(seqs, batch_first=True, padding_value=0)
+    return imgs, seqs, texts
 
 
 # ---------------------------
-# FastPlateOCR Model
+# Metrics
 # ---------------------------
-class FastPlateOCR(nn.Module):
-    def __init__(self, vocab_size, d_model=256, nhead=8, num_layers=4, pretrained=True):
-        super().__init__()
+def cer(ref, hyp):
+    return editdistance.eval(ref, hyp) / max(1, len(ref))
 
-        # CNN encoder backbone
-        backbone = mobilenet_v3_small(
-            weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
-        )
-        self.cnn = nn.Sequential(*list(backbone.features.children()))
-        cnn_out = 576  # MobileNetV3-small last channel size
+@torch.no_grad()
+def validate(model, loader, dataset, device, beam_width=5):
+    model.eval()
+    tot_cer, tot_exact, n = 0.0, 0, 0
+    for imgs, _, texts in loader:
+        imgs = imgs.to(device)
+        for i in range(imgs.size(0)):
+            ids = model.beam_decode(imgs[i].unsqueeze(0), beam_width=beam_width, device=device)
+            pred = dataset.seq_to_text(ids)
+            gt = texts[i]
+            tot_cer += cer(gt, pred)
+            tot_exact += (gt == pred)
+            n += 1
+    return (tot_cer/n, tot_exact/n) if n>0 else (0.0,0.0)
 
-        # projection to transformer dim
-        self.proj = nn.Conv2d(cnn_out, d_model, 1)
 
-        # transformer decoder
-        self.pos_enc = PositionalEncoding(d_model)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model, nhead=nhead,
-            dim_feedforward=512, dropout=0.1
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+# ---------------------------
+# Training function
+# ---------------------------
+def train_fastplateocr(csv_file, img_dir="src2/resized_plates",
+                       epochs=20, batch_size=16, beam_width=5, lr=1e-4):
 
-        # embeddings + classifier
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.fc_out = nn.Linear(d_model, vocab_size)
+    # vocab
+    charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    vocab = ['<pad>', '<sos>', '<eos>'] + list(charset)
 
-        self.d_model = d_model
-        self.vocab_size = vocab_size
+    # dataset
+    dataset = PlateDataset(csv_file, vocab, img_dir=img_dir, train=True)
+    val_size = max(1, int(0.1 * len(dataset)))
+    train_size = len(dataset) - val_size
+    train_ds, val_ds = random_split(dataset, [train_size, val_size])
 
-    def forward(self, imgs, tgt_inp):
-        # imgs: [B,3,H,W], tgt_inp: [B,T]
-        feats = self.cnn(imgs)                  # [B,C,H’,W’]
-        feats = self.proj(feats)                # [B,d,H’,W’]
-        B, C, H, W = feats.shape
-        feats = feats.permute(0, 2, 3, 1).reshape(B, H*W, C).permute(1, 0, 2)
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
+                              shuffle=True, collate_fn=collate_fn, num_workers=2)
+    val_loader = DataLoader(val_ds, batch_size=1,
+                            shuffle=False, collate_fn=collate_fn, num_workers=1)
 
-        tgt_emb = self.embedding(tgt_inp) * (self.d_model ** 0.5)
-        tgt_emb = self.pos_enc(tgt_emb)        # add PE
-        tgt_emb = tgt_emb.permute(1, 0, 2)
+    # model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = FastPlateOCR(vocab_size=len(vocab)).to(device)
 
-        out = self.decoder(tgt_emb, feats)     # [T,B,C]
-        out = out.permute(1, 0, 2)
-        return self.fc_out(out)
+    # optimizer + scheduler + scaler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scaler = GradScaler()
+
+    # training logs
+    logs = {
+        "train_losses": [],
+        "val_cers": [],
+        "val_accs": []
+    }
+    train_losses, val_cers, val_accs = [], [], []
+
+    for epoch in range(1, epochs+1):
+        model.train()
+        running_loss = 0.0
+        for imgs, seqs, _ in train_loader:
+            imgs, seqs = imgs.to(device), seqs.to(device)
+            tgt_inp, tgt_out = seqs[:, :-1], seqs[:, 1:]
+
+            optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                logits = model(imgs, tgt_inp)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    tgt_out.reshape(-1),
+                    ignore_index=0
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item()
+
+        scheduler.step()
+        avg_loss = running_loss / len(train_loader)
+        train_losses.append(avg_loss)
+
+        val_cer, val_acc = validate(model, val_loader, dataset, device, beam_width)
+        val_cers.append(val_cer); val_accs.append(val_acc)
+        # 🔥 Save sample result images each epoch
+        # Update charts
+        logs["train_losses"].append(total_loss/len(train_loader))
+        logs["val_cers"].append(val_cer)
+        logs["val_accs"].append(val_acc)
+        plot_training_curves(logs, out_dir="results")
+        visualize_predictions(model, val_loader, dataset, device, epoch, out_dir="results")
+
+        print(f"Epoch {epoch}/{epochs} | loss {avg_loss:.4f} | CER {val_cer:.3f} | Acc {val_acc:.3f} | lr {scheduler.get_last_lr()[0]:.6f}")
 
     # ---------------------------
-    # Greedy decode
+    # Plot results
     # ---------------------------
-    def greedy_decode(self, img, max_len=32, sos_id=1, eos_id=2, device="cpu"):
-        self.eval()
-        with torch.no_grad():
-            feats = self.cnn(img)
-            feats = self.proj(feats)
-            B, C, H, W = feats.shape
-            feats = feats.permute(0, 2, 3, 1).reshape(B, H*W, C).permute(1, 0, 2)
+    plt.figure(figsize=(10,4))
+    plt.subplot(1,3,1); plt.plot(train_losses); plt.title("Train Loss")
+    plt.subplot(1,3,2); plt.plot(val_cers); plt.title("Val CER")
+    plt.subplot(1,3,3); plt.plot(val_accs); plt.title("Val Acc")
+    plt.tight_layout()
+    plt.savefig("training_curves.png"); plt.close()
 
-            ys = torch.full((1, 1), sos_id, dtype=torch.long, device=device)
-            for _ in range(max_len - 1):
-                tgt_emb = self.embedding(ys) * (self.d_model ** 0.5)
-                tgt_emb = self.pos_enc(tgt_emb)
-                tgt_emb = tgt_emb.permute(1, 0, 2)
-                out = self.decoder(tgt_emb, feats)
-                out = self.fc_out(out.permute(1, 0, 2))[:, -1, :]
-                next_word = out.argmax(dim=-1).unsqueeze(0)
-                ys = torch.cat([ys, next_word], dim=1)
-                if next_word.item() == eos_id:
-                    break
-        return ys.squeeze(0).tolist()
+    return model, vocab, (train_losses, val_cers, val_accs)
 
-    # ---------------------------
-    # Beam search (memory-safe)
-    # ---------------------------
-    def beam_decode(self, img, beam_width=5, max_len=32, sos_id=1, eos_id=2, device="cpu"):
-        self.eval()
-        with torch.no_grad():
-            feats = self.cnn(img)
-            feats = self.proj(feats)
-            B, C, H, W = feats.shape
-            feats = feats.permute(0, 2, 3, 1).reshape(B, H*W, C).permute(1, 0, 2)
 
-            # [seq, score]
-            sequences = [(torch.full((1, 1), sos_id, dtype=torch.long, device=device), 0.0)]
+def visualize_predictions(model, dataset, device, epoch, num_samples=6, out_dir="results"):
+    os.makedirs(out_dir, exist_ok=True)
+    model.eval()
+    idxs = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
 
-            for _ in range(max_len):
-                all_candidates = []
-                for seq, score in sequences:
-                    if seq[0, -1].item() == eos_id:
-                        all_candidates.append((seq, score))
-                        continue
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+    axes = axes.flatten()
 
-                    tgt_emb = self.embedding(seq) * (self.d_model ** 0.5)
-                    tgt_emb = self.pos_enc(tgt_emb)
-                    tgt_emb = tgt_emb.permute(1, 0, 2)
-                    out = self.decoder(tgt_emb, feats)
-                    out = self.fc_out(out.permute(1, 0, 2))[:, -1, :]
-                    log_probs = F.log_softmax(out, dim=-1)
+    with torch.no_grad():
+        for j, idx in enumerate(idxs):
+            img_t, _, gt_text = dataset[idx]
+            img_t = img_t.unsqueeze(0).to(device)
 
-                    topk = torch.topk(log_probs, beam_width)
-                    for i in range(beam_width):
-                        token = topk.indices[0, i].item()
-                        prob = topk.values[0, i].item()
-                        new_seq = torch.cat(
-                            [seq, torch.tensor([[token]], device=device)], dim=1
-                        )
-                        all_candidates.append((new_seq, score + prob))
+            ids = model.beam_decode(img_t, beam_width=5, device=device)
+            pred_text = dataset.seq_to_text(ids)
 
-                sequences = sorted(all_candidates, key=lambda tup: tup[1], reverse=True)[:beam_width]
+            # Convert back to numpy for visualization
+            img = img_t[0].cpu().permute(1,2,0).numpy()
+            img = (img * np.array([0.229,0.224,0.225]) + np.array([0.485,0.456,0.406]))
+            img = np.clip(img, 0, 1)
 
-            return sequences[0][0].squeeze(0).tolist()
+            axes[j].imshow(img)
+            axes[j].set_title(f"GT: {gt_text}\nPred: {pred_text}", fontsize=9)
+            axes[j].axis("off")
+
+        # Hide unused subplots
+        for k in range(j+1, len(axes)):
+            axes[k].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"epoch_{epoch:02d}.png"))
+    plt.close()
+
+
+# ---------------------------
+# Entry
+# ---------------------------
+if __name__ == "__main__":
+    model, vocab, logs = train_fastplateocr("image_data.csv",
+                                            img_dir="resized_plates",
+                                            epochs=20,
+                                            batch_size=32,
+                                            beam_width=5)
