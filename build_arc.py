@@ -125,7 +125,7 @@ def validate(model, loader, dataset, device, beam_width=5):
 # Training function
 # ---------------------------
 def train_fastplateocr(csv_file, img_dir="src2/resized_plates",
-                       epochs=20, batch_size=32, beam_width=5, lr=1e-4):
+                       epochs=20, batch_size=16, beam_width=5, lr=1e-4):
 
     # vocab
     charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -152,6 +152,11 @@ def train_fastplateocr(csv_file, img_dir="src2/resized_plates",
     scaler = GradScaler()
 
     # training logs
+    logs = {
+        "train_losses": [],
+        "val_cers": [],
+        "val_accs": []
+    }
     train_losses, val_cers, val_accs = [], [], []
 
     for epoch in range(1, epochs+1):
